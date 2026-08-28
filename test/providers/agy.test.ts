@@ -80,7 +80,13 @@ describe("Antigravity quota parsing", () => {
         resetsAt: "2026-06-20T00:39:54.000Z",
       },
     ]);
-    expect(result?.windows.every((window) => !window.windowSeconds)).toBe(true);
+    expect(
+      result?.windows.every((window) =>
+        window.kind === "session"
+          ? window.windowSeconds === 18_000
+          : window.windowSeconds === 604_800,
+      ),
+    ).toBe(true);
   });
 
   it("normalizes oneof remaining values", () => {
@@ -104,6 +110,26 @@ describe("Antigravity quota parsing", () => {
       percentUsed: 50,
       percentRemaining: 50,
     });
+    expect(result?.windows[0]?.windowSeconds).toBe(604_800);
+  });
+
+  it("leaves windowSeconds unset for an unknown window kind", () => {
+    const result = normalizeAgyQuotaSummary({
+      groups: [
+        {
+          displayName: "Gemini Models",
+          buckets: [
+            {
+              bucketId: "gemini-mystery",
+              displayName: "Mystery Limit",
+              remaining: { case: "remainingFraction", value: 0.5 },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result?.windows[0]).toMatchObject({ kind: "unknown" });
     expect(result?.windows[0]?.windowSeconds).toBeUndefined();
   });
 

@@ -25,6 +25,8 @@ import {
   successProvider,
 } from "./common.js";
 
+const AGY_FIVE_HOURS_SECONDS = 18_000;
+const AGY_SEVEN_DAYS_SECONDS = 604_800;
 const QUOTA_SUMMARY_PATH =
   "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const USER_STATUS_PATH =
@@ -544,6 +546,9 @@ function normalizeQuotaSummaryBucket(
       parseEpochOrIso(bucket.resetTime) ?? parseEpochOrIso(bucket.reset_time),
     resetText: stringValue(bucket.description),
   };
+  if (windowKind.id === "5h") result.windowSeconds = AGY_FIVE_HOURS_SECONDS;
+  else if (windowKind.id === "weekly")
+    result.windowSeconds = AGY_SEVEN_DAYS_SECONDS;
   const remaining = remainingFraction(bucket);
   if (remaining !== undefined) {
     const percentUsed = clampPercent((1 - clampFraction(remaining)) * 100);
