@@ -20,7 +20,7 @@ describe("model catalog", () => {
     expect(() => validateModelCatalog(MODEL_CATALOG)).not.toThrow();
     expect(
       new Set(MODEL_CATALOG.entries.map((entry) => entry.provider)),
-    ).toEqual(new Set(["claude", "codex", "grok", "kimi"]));
+    ).toEqual(new Set(["agy", "claude", "codex", "grok", "kimi"]));
     expect(
       new Set(MODEL_CATALOG.entries.map((entry) => entry.intelligence)),
     ).toEqual(new Set(["high", "medium", "low"]));
@@ -45,6 +45,46 @@ describe("model catalog", () => {
 });
 
 describe("model quota join", () => {
+  it("joins Gemini 3.7 Flash to the Gemini-only quota scope", () => {
+    const response = createModelsResponse({
+      generatedAt,
+      schemaVersion: 5,
+      providers: [
+        {
+          provider: "agy",
+          label: "Antigravity",
+          source: "cli-rpc",
+          windows: [],
+          quotaSemantics: {
+            status: "unknown",
+            effectiveAvailability: [
+              {
+                scope: "gemini_only",
+                status: "known",
+                effectivePercentRemaining: 91,
+                boundedBy: ["gemini_5h", "gemini_weekly"],
+              },
+            ],
+            unresolvedWindowIds: ["claude_gpt_weekly"],
+          },
+          state: { status: "fresh", stale: false },
+        },
+      ],
+    });
+
+    expect(response.models).toContainEqual(
+      expect.objectContaining({
+        provider: "agy",
+        id: "gemini-3.7-flash",
+        quotaScopes: ["gemini_only"],
+        effective: expect.objectContaining({
+          scope: "gemini_only",
+          effectivePercentRemaining: 91,
+        }),
+      }),
+    );
+  });
+
   it("uses the specific scope when known, falls back to account evidence, and discloses unmapped windows", () => {
     const response = createModelsResponse(quotaResponse(), {
       catalog: testCatalog(),

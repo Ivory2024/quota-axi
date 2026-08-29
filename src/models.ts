@@ -179,6 +179,12 @@ function availabilityFor(
   provider: ProviderQuota,
 ): EffectiveAvailability | undefined {
   const availability = provider.quotaSemantics?.effectiveAvailability ?? [];
+  if (
+    entry.provider === "agy" &&
+    entry.windowIds?.includes("model:gemini_only")
+  ) {
+    return availability.find((candidate) => candidate.scope === "gemini_only");
+  }
   for (const windowId of entry.windowIds ?? []) {
     const found = availability.find(
       (candidate) => candidate.scope === normalizedModelScope(windowId),
