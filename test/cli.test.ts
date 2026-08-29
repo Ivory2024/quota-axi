@@ -906,6 +906,52 @@ describe("default TOON decision blocks", () => {
     expect(output).toContain("exhaustion[0]:");
   });
 
+  it("reports measured through-reset quota confidence when usage is zero", async () => {
+    useTempCache();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T14:00:00.000Z"));
+    PROVIDERS.agy = providerWithQuota({
+      provider: "agy",
+      label: "Antigravity",
+      source: "cli-rpc",
+      windows: [
+        {
+          id: "gemini_5h",
+          label: "Gemini 5-hour",
+          kind: "session",
+          percentUsed: 0,
+          percentRemaining: 100,
+          windowSeconds: 18_000,
+          resetsAt: "2026-07-16T17:00:00.000Z",
+        },
+        {
+          id: "gemini_weekly",
+          label: "Gemini weekly",
+          kind: "weekly",
+          percentUsed: 9,
+          percentRemaining: 91,
+          windowSeconds: 604_800,
+          resetsAt: "2026-07-22T10:00:00.000Z",
+        },
+      ],
+      state: { status: "fresh", stale: false, sourcesTried: ["loopback"] },
+    });
+
+    const output = await capture(["--provider", "agy"]);
+    const rows = toonRows(output, "quota");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual([
+      "agy",
+      "gemini_only",
+      "91",
+      expect.any(String),
+      "through_reset",
+      "established",
+      "gemini_weekly",
+      "2026-07-22T10:00:00.000Z",
+    ]);
+  });
+
   it("keeps unknown-scope exhaustion in attention without an orphan row", async () => {
     useTempCache();
     vi.useFakeTimers();
