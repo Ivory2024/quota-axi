@@ -506,7 +506,12 @@ describe("quota semantics", () => {
     );
     expect(agy.quotaSemantics).toMatchObject({
       status: "unknown",
-      effectiveAvailability: [],
+      effectiveAvailability: [
+        expect.objectContaining({
+          scope: "gemini_only",
+          status: "unknown",
+        }),
+      ],
       unresolvedWindowIds: ["gemini_5h", "gemini_weekly"],
     });
 
@@ -861,5 +866,73 @@ describe("per-scope selection signal", () => {
       withQuotaSemantics(missingCycle, GENERATED_AT).quotaSemantics
         ?.effectiveAvailability[0]?.selection,
     ).toEqual({ status: "unknown", unmeasurableWindowIds: ["seven_day"] });
+  });
+
+  it("exposes Gemini-only availability without using Claude/GPT weekly", () => {
+    const result = withQuotaSemantics(
+      provider("agy", [
+        window("gemini_5h", "session", 80, {
+          windowSeconds: FIVE_HOURS_SECONDS,
+          resetsAt: after(2 * HOUR_SECONDS),
+        }),
+        window("gemini_weekly", "weekly", 91, {
+          windowSeconds: WEEK_SECONDS,
+          resetsAt: after(6 * DAY_SECONDS),
+        }),
+        window("claude_gpt_weekly", "weekly", 0, {
+          windowSeconds: WEEK_SECONDS,
+          resetsAt: after(1 * DAY_SECONDS),
+        }),
+      ]),
+      GENERATED_AT,
+    );
+
+    expect(result.quotaSemantics).toMatchObject({
+      status: "unknown",
+      effectiveAvailability: [
+        {
+          scope: "gemini_only",
+          status: "known",
+          effectivePercentRemaining: 80,
+          boundedBy: ["gemini_5h", "gemini_weekly"],
+        },
+      ],
+      unresolvedWindowIds: ["gemini_5h", "gemini_weekly", "claude_gpt_weekly"],
+    });
+    expect(result.quotaSemantics?.effectiveAvailability).not.toContainEqual(
+      expect.objectContaining({ scope: "all_models" }),
+    );
+  });
+
+  it("fails the Gemini-only aggregate closed when Gemini 5h pace is unknown", () => {
+    const result = withQuotaSemantics(
+      provider("agy", [
+        window("gemini_5h", "session", 100, {
+          windowSeconds: FIVE_HOURS_SECONDS,
+        }),
+        window("gemini_weekly", "weekly", 91, {
+          windowSeconds: WEEK_SECONDS,
+          resetsAt: after(6 * DAY_SECONDS),
+        }),
+        window("claude_gpt_weekly", "weekly", 0, {
+          windowSeconds: WEEK_SECONDS,
+          resetsAt: after(1 * DAY_SECONDS),
+        }),
+      ]),
+      GENERATED_AT,
+    );
+
+    expect(result.quotaSemantics?.effectiveAvailability).toContainEqual(
+      expect.objectContaining({
+        scope: "gemini_only",
+        status: "unknown",
+        boundedBy: ["gemini_5h", "gemini_weekly"],
+        effectivePercentRemaining: undefined,
+        selection: {
+          status: "unknown",
+          unmeasurableWindowIds: ["gemini_5h"],
+        },
+      }),
+    );
   });
 });

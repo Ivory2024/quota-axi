@@ -681,6 +681,7 @@ Auth source entries can include `credentialPresent` when a non-secret probe conf
 - It prefers `RetrieveUserQuotaSummary` with `forceRefresh: false`, uses `GetUserStatus` for plan identity and account identity exposed only behind `--full`, and can fall back to model quota data from `GetUserStatus` / `GetCommandModelConfigs` when grouped quota summary is unavailable.
 - Percent remaining and reset times come only from vendor `remainingFraction`/`resetTime` fields. It does not invent windows, resets, or percentages.
 - Burn rate is not reported for Antigravity v1 because the local payload exposes point-in-time quota snapshots, not enough history to compute a rate honestly.
+- The all-provider Antigravity aggregate remains unresolved. When `gemini_*` windows are present, `quotaSemantics.effectiveAvailability` also exposes a `gemini_only` scope bounded only by those windows; `claude_gpt_weekly` never bounds it. An unknown Gemini five-hour cycle keeps that scope's effective status unknown even when its point-in-time remaining value is 100%.
 
 ### Delegated credential refresh
 

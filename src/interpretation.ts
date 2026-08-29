@@ -102,12 +102,50 @@ function semanticsFor(
     case "cursor":
       return cursorSemantics(provider.windows, generatedAt);
     case "copilot":
-    case "agy":
       return unknownSemantics(
         provider.windows,
         `quota-axi does not know whether ${provider.label ?? provider.provider}'s reported windows are independent or jointly bounding, so it does not claim an effective remaining percentage.`,
       );
+    case "agy":
+      return agySemantics(provider.windows, generatedAt);
   }
+}
+
+function agySemantics(
+  windows: QuotaWindow[],
+  generatedAt: string,
+): QuotaSemantics {
+  const gemini = windows.filter(({ id }) => id.startsWith("gemini_"));
+  if (gemini.length === 0) {
+    return unknownSemantics(
+      windows,
+      "quota-axi does not know whether Antigravity's reported windows are independent or jointly bounding, so it does not claim an effective remaining percentage.",
+    );
+  }
+
+  const geminiPaceUnknown = gemini.some(
+    ({ pace, percentRemaining }) =>
+      percentRemaining === undefined || pace?.status === "unknown",
+  );
+  const geminiAvailability = availability("gemini_only", gemini, generatedAt);
+  const effectiveAvailability = [
+    geminiPaceUnknown
+      ? {
+          ...geminiAvailability,
+          status: "unknown" as const,
+          effectivePercentRemaining: undefined,
+          limitingWindowIds: undefined,
+        }
+      : geminiAvailability,
+  ];
+
+  return {
+    status: "unknown",
+    description:
+      "Antigravity's all-provider aggregate remains unresolved. Gemini windows jointly bound Gemini model usage and are exposed separately; Claude/GPT windows do not bound the Gemini-only scope.",
+    effectiveAvailability,
+    unresolvedWindowIds: windows.map(({ id }) => id),
+  };
 }
 
 function claudeSemantics(
