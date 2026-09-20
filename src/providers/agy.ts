@@ -251,11 +251,38 @@ async function fetchCliQuota(runtime: AgyProbeRuntime): Promise<{
   } catch {
     throw new AgyMalformedResponseError("agy /quota returned invalid JSON");
   }
+  const cliAuthPromptFailure = agyCliAuthPromptTimeout(parsed);
+  if (cliAuthPromptFailure) throw cliAuthPromptFailure;
   const summary = normalizeAgyPrintUsage(parsed);
   if (!summary || summary.windows.length === 0) {
     throw new AgyMalformedResponseError("agy /quota quota summary malformed");
   }
   return summary;
+}
+
+/**
+ * `agy -p /quota` runs its own headless OAuth-prompt check per invocation,
+ * separate from a desktop Antigravity session's login. When that prompt
+ * times out (no browser to complete it in a non-interactive context), the
+ * CLI still exits 0 with `{"status":"ERROR","error":"authentication failed
+ * or timed out"}` and no `command` field - a per-call hiccup, not proof the
+ * account itself is signed out. Left unrecognized, this fell through to a
+ * generic "malformed" error whose ambiguity let a coincidental loopback 401
+ * escalate it to `auth_required` and retire a perfectly good cache. Treat it
+ * as `unavailable` instead: retryable, and stale cache stays servable.
+ */
+function agyCliAuthPromptTimeout(parsed: unknown): Error | undefined {
+  const root = objectValue(parsed);
+  if (stringValue(root?.status) !== "ERROR") return undefined;
+  const message = stringValue(root?.error);
+  if (
+    !message ||
+    !/authentication.*(?:failed|required|timed out)/i.test(message)
+  )
+    return undefined;
+  return new AgyUnavailableError(
+    `Antigravity CLI auth prompt unavailable: ${message}`,
+  );
 }
 
 function isMissingCommandError(error: unknown): boolean {

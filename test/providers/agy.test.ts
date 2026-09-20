@@ -632,6 +632,44 @@ describe("Antigravity provider", () => {
     expect(JSON.stringify(result)).not.toContain("private-account");
   });
 
+  it("treats a CLI headless auth-prompt timeout as unavailable, not a sign-out", async () => {
+    writeCachedProviders([cachedAgyQuota()]);
+
+    const result = await fetchQuotaWithRuntime(
+      runtimeWith({
+        ps: "",
+        agyPath: "/Users/test/.local/bin/agy",
+        agyOutput: JSON.stringify({
+          conversation_id: "",
+          status: "ERROR",
+          response: "",
+          error: "authentication failed or timed out",
+        }),
+      }),
+    );
+
+    expect(result.state.status).toBe("stale");
+    expect(result.source).toBe("cache");
+    expect(readCachedProvider("agy")).toBeDefined();
+  });
+
+  it("does not report a CLI auth-prompt timeout itself as auth_required", async () => {
+    const result = await fetchQuotaWithRuntime(
+      runtimeWith({
+        ps: "",
+        agyPath: "/Users/test/.local/bin/agy",
+        agyOutput: JSON.stringify({
+          conversation_id: "",
+          status: "ERROR",
+          response: "",
+          error: "authentication failed or timed out",
+        }),
+      }),
+    );
+
+    expect(result.state.status).toBe("unavailable");
+  });
+
   it("sends the CLI 1.2.2 read-only request envelope without a token", async () => {
     let receivedBody: unknown;
     let receivedCsrfToken: string | undefined;
