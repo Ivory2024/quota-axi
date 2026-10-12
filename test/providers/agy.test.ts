@@ -1,5 +1,12 @@
-import { readFileSync } from "node:fs";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import {
   createServer,
   type IncomingMessage,
@@ -7,11 +14,16 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { currentUserProcessListArgs } from "../../src/lib/process.js";
+import {
+  currentUserProcessListArgs,
+  type ExecFileTextOptions,
+} from "../../src/lib/process.js";
 import { readCachedProvider, writeCachedProviders } from "../../src/cache.js";
 import {
+  agyAdapter,
+  fetchQuota,
   fetchQuotaWithRuntime,
   inspectAuthWithRuntime,
   normalizeAgyPrintUsage,
@@ -23,10 +35,13 @@ import {
   type AgyConnectionEndpoint,
   type AgyProbeRuntime,
 } from "../../src/providers/agy.js";
+import { providerPresence } from "../../src/lib/source-attempts.js";
 import { withQuotaSemantics } from "../../src/interpretation.js";
 import type { ProviderQuota } from "../../src/types.js";
 
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+const originalPath = process.env.PATH;
+const originalWorkingDirectory = process.cwd();
 let tempDir: string | undefined;
 const servers: ReturnType<typeof createServer>[] = [];
 
@@ -45,9 +60,21 @@ afterEach(async () => {
   );
   if (originalXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
   else process.env.XDG_CACHE_HOME = originalXdgCacheHome;
+  if (originalPath === undefined) delete process.env.PATH;
+  else process.env.PATH = originalPath;
+  process.chdir(originalWorkingDirectory);
   if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   tempDir = undefined;
 });
+
+// The vendor names each bucket's window ("5h" or "weekly"), which fixes its
+// cycle length; quota-axi derives pace from that length plus resetsAt.
+const EXPECTED_WINDOW_SECONDS = [
+  ["gemini_5h", 18_000],
+  ["gemini_weekly", 604_800],
+  ["claude_gpt_5h", 18_000],
+  ["claude_gpt_weekly", 604_800],
+];
 
 describe("Antigravity quota parsing", () => {
   it("normalizes quota summary groups into session and weekly windows", () => {
@@ -87,9 +114,9 @@ describe("Antigravity quota parsing", () => {
         resetsAt: "2026-06-20T00:39:54.000Z",
       },
     ]);
-    expect(result?.windows.every((w) => w.windowSeconds === undefined)).toBe(
-      true,
-    );
+    expect(
+      result?.windows.map(({ id, windowSeconds }) => [id, windowSeconds]),
+    ).toEqual(EXPECTED_WINDOW_SECONDS);
   });
 
   it("normalizes the Antigravity CLI 1.2.2 quota summary shape", () => {
@@ -116,6 +143,43 @@ describe("Antigravity quota parsing", () => {
     ]);
   });
 
+  it.each(["window", "bucketId", "bucket_id", "displayName", "name"])(
+    "leaves unfamiliar cycles in %s unmeasured",
+    (field) => {
+      for (const label of [
+        "biweekly",
+        "bi-weekly",
+        "bi_weekly",
+        "weekend",
+        "15h",
+        "five-day",
+        "five-hourly",
+      ]) {
+        for (const groupName of ["Gemini Models", "Claude and GPT Models"]) {
+          const result = normalizeAgyQuotaSummary({
+            groups: [
+              {
+                displayName: groupName,
+                buckets: [
+                  {
+                    [field === "bucket_id" ? "bucket_id" : "bucketId"]:
+                      "unfamiliar",
+                    [field]: label,
+                    remainingFraction: 0.9,
+                    resetTime: "2026-06-19T00:00:00.000Z",
+                  },
+                ],
+              },
+            ],
+          });
+          expect(result?.windows).toHaveLength(1);
+          expect(result?.windows[0]?.kind).toBe("unknown");
+          expect(result?.windows[0]?.windowSeconds).toBeUndefined();
+        }
+      }
+    },
+  );
+
   it("normalizes oneof remaining values", () => {
     const result = normalizeAgyQuotaSummary({
       groups: [
@@ -137,7 +201,7 @@ describe("Antigravity quota parsing", () => {
       percentUsed: 50,
       percentRemaining: 50,
     });
-    expect(result?.windows[0]?.windowSeconds).toBeUndefined();
+    expect(result?.windows[0]?.windowSeconds).toBe(604_800);
   });
 
   it("normalizes the agy CLI /quota print envelope", () => {
@@ -162,9 +226,13 @@ describe("Antigravity quota parsing", () => {
         percentRemaining: 90,
       },
     ]);
-    expect(result?.windows.every((w) => w.windowSeconds === undefined)).toBe(
-      true,
-    );
+    expect(
+      result?.windows.map(({ id, windowSeconds }) => [id, windowSeconds]),
+    ).toEqual([
+      ["gemini_weekly", 604_800],
+      ["claude_gpt_5h", 18_000],
+      ["claude_gpt_weekly", 604_800],
+    ]);
   });
 
   it("falls back to model windows from user status payloads", () => {
@@ -505,17 +573,75 @@ describe("Antigravity provider", () => {
     expect(result.state.error).toBe("Antigravity quota summary malformed");
   });
 
-  it("uses stale cache when the live loopback source is unavailable", async () => {
-    writeCachedProviders([cachedAgyQuota()]);
+  it.skipIf(process.platform === "win32")(
+    "does not serve cached quota when Antigravity is uninstalled",
+    async () => {
+      writeCachedProviders([cachedAgyQuota()]);
 
-    const result = await fetchQuotaWithRuntime(runtimeWith({ ps: "" }));
+      const result = await fetchQuotaWithRuntime(runtimeWith({ ps: "" }));
+
+      expect(result.state.status).toBe("unavailable");
+      expect(result.state.error).toBe("Antigravity/agy is not running");
+      expect(result.source).not.toBe("cache");
+      expect(providerPresence(result, agyAdapter)).toBe("absent");
+      expect(readCachedProvider("agy")).toBeUndefined();
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "keeps cached quota when Windows cannot confirm Antigravity absence",
+    async () => {
+      const runtime = runtimeWith({ ps: "" });
+      const withoutCache = await fetchQuotaWithRuntime(runtime);
+
+      expect(providerPresence(withoutCache, agyAdapter)).toBe("absent");
+
+      writeCachedProviders([cachedAgyQuota()]);
+      const result = await fetchQuotaWithRuntime(runtime);
+
+      expect(result.state.status).toBe("stale");
+      expect(result.source).toBe("cache");
+      expect(providerPresence(result, agyAdapter)).toBe("stale");
+      expect(readCachedProvider("agy")).toBeDefined();
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "reports attention and preserves cache when agy process is running but has no accessible port",
+    async () => {
+      const runtime = runtimeWith({
+        ps: "123 /Users/test/.local/bin/agy\n",
+        lsof: "",
+        cliQuota: Object.assign(new Error("agy missing"), { code: "ENOENT" }),
+      });
+      const withoutCache = await fetchQuotaWithRuntime(runtime);
+
+      expect(providerPresence(withoutCache, agyAdapter)).toBe("attention");
+
+      writeCachedProviders([cachedAgyQuota()]);
+      const result = await fetchQuotaWithRuntime(runtime);
+
+      expect(result.state.status).toBe("stale");
+      expect(result.source).toBe("cache");
+      expect(readCachedProvider("agy")).toBeDefined();
+    },
+  );
+
+  it("preserves cache when language-server process is running without a CSRF token", async () => {
+    writeCachedProviders([cachedAgyQuota()]);
+    const port = 64440;
+
+    const result = await fetchQuotaWithRuntime(
+      runtimeWith({
+        ps: `123 /Applications/Google Antigravity.app/Contents/Resources/bin/language-server\n`,
+        lsofByPid: { 123: lsofFor(123, port) },
+        cliQuota: Object.assign(new Error("agy missing"), { code: "ENOENT" }),
+      }),
+    );
 
     expect(result.state.status).toBe("stale");
     expect(result.source).toBe("cache");
-    expect(result.windows[0]).toMatchObject({
-      id: "gemini_5h",
-      percentRemaining: 88,
-    });
+    expect(readCachedProvider("agy")).toBeDefined();
   });
 
   it("preserves authentication failures and retires stale cache", async () => {
@@ -547,6 +673,7 @@ describe("Antigravity provider", () => {
       command: string;
       args: string[];
       timeoutMs: number;
+      path?: string;
     }> = [];
     let loopbackCalled = false;
     const port = await startServer((response) => {
@@ -562,8 +689,13 @@ describe("Antigravity provider", () => {
         agyPath: "/Users/test/.local/bin/agy",
         agyOutput: JSON.stringify(fixture("usage-print-v1.2.2.json")),
         requestJson: requestLoopbackJson,
-        onExec(command, args, timeoutMs) {
-          commands.push({ command, args, timeoutMs });
+        onExec(command, args, timeoutMs, options) {
+          commands.push({
+            command,
+            args,
+            timeoutMs,
+            path: options?.env?.PATH,
+          });
         },
       }),
     );
@@ -577,13 +709,130 @@ describe("Antigravity provider", () => {
       "claude_gpt_5h",
       "claude_gpt_weekly",
     ]);
-    expect(commands.at(-1)).toEqual({
+    expect(commands.at(-1)).toMatchObject({
       command: "/Users/test/.local/bin/agy",
       args: ["-p", "/quota", "--output-format", "json"],
       timeoutMs: 15_000,
     });
+    expect(
+      commands.at(-1)?.path?.split(delimiter).slice(1).join(delimiter),
+    ).toBe(process.env.PATH ?? "");
     expect(loopbackCalled).toBe(false);
   });
+
+  it.skipIf(process.platform === "win32").each([
+    ["xdg-open", "inherited PATH"],
+    ["xdg-open", "working directory"],
+    ["open", "inherited PATH"],
+    ["open", "working directory"],
+  ] as const)(
+    "prevents a signed-out agy quota probe from invoking %s in the %s",
+    async (opener, openerLocation) => {
+      const bin = join(tempDir as string, "bin");
+      const workingDirectory = join(tempDir as string, "working");
+      const marker = join(tempDir as string, "browser-opened");
+      mkdirSync(bin);
+      mkdirSync(workingDirectory);
+      writeFileSync(
+        join(bin, "agy"),
+        `#!/bin/sh
+${opener} 'https://accounts.example.invalid/oauth'
+exit 1
+`,
+      );
+      const openerDirectory =
+        openerLocation === "inherited PATH" ? bin : workingDirectory;
+      writeFileSync(
+        join(openerDirectory, opener),
+        `#!/bin/sh
+printf opened > '${marker}'
+`,
+      );
+      chmodSync(join(bin, "agy"), 0o700);
+      chmodSync(join(openerDirectory, opener), 0o700);
+      process.env.PATH = bin;
+      process.chdir(workingDirectory);
+
+      const result = await fetchQuota({
+        allowKeychainPrompt: false,
+        refreshCredentials: false,
+      });
+
+      expect(result.state).toMatchObject({
+        status: "error",
+        error: "Antigravity CLI /quota failed",
+      });
+      expect(existsSync(marker)).toBe(false);
+    },
+  );
+
+  it
+    .skipIf(process.platform === "win32")
+    .each([
+      "#!/usr/bin/env node",
+      "#!/usr/bin/env -S node --enable-source-maps",
+      ...(existsSync("/bin/env") ? ["#!/bin/env node"] : []),
+    ])(
+    "runs an authenticated agy CLI with the %s shebang when PATH has no node",
+    async (shebang) => {
+      const bin = join(tempDir as string, "bin");
+      const payload = JSON.stringify(fixture("usage-print-v1.2.2.json"));
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "agy"),
+        `${shebang}
+process.stdout.write(${JSON.stringify(payload)});
+`,
+      );
+      chmodSync(join(bin, "agy"), 0o700);
+      process.env.PATH = bin;
+
+      const result = await fetchQuota({
+        allowKeychainPrompt: false,
+        refreshCredentials: false,
+      });
+
+      expect(result.state.status).toBe("fresh");
+      expect(result.source).toBe("cli");
+      expect(result.windows.map((window) => window.id)).toEqual([
+        "gemini_5h",
+        "gemini_weekly",
+        "claude_gpt_5h",
+        "claude_gpt_weekly",
+      ]);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "preserves runtime lookup in an authenticated shell launcher",
+    async () => {
+      const bin = join(tempDir as string, "bin");
+      const script = join(bin, "agy-cli.js");
+      const payload = JSON.stringify(fixture("usage-print-v1.2.2.json"));
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "agy"),
+        `#!/bin/sh
+exec node "$0-cli.js" "$@"
+`,
+      );
+      writeFileSync(
+        script,
+        `process.stdout.write(${JSON.stringify(payload)});
+`,
+      );
+      chmodSync(join(bin, "agy"), 0o700);
+      process.env.PATH = bin;
+
+      const result = await fetchQuota({
+        allowKeychainPrompt: false,
+        refreshCredentials: false,
+      });
+
+      expect(result.state.status).toBe("fresh");
+      expect(result.source).toBe("cli");
+    },
+  );
 
   it("does not serve stale quota when protected loopback and print usage fail", async () => {
     writeCachedProviders([cachedAgyQuota()]);
@@ -831,13 +1080,16 @@ describe("Antigravity provider", () => {
     ]);
   });
 
-  it("still serves stale cache when both loopback and the CLI are unavailable", async () => {
+  it("keeps stale cache for an installed but stopped Antigravity CLI", async () => {
     writeCachedProviders([cachedAgyQuota()]);
 
     const result = await fetchQuotaWithRuntime(
       runtimeWith({
         ps: "",
-        cliQuota: Object.assign(new Error("agy missing"), { code: "ENOENT" }),
+        agyPath: "/Users/test/.local/bin/agy",
+        cliQuota: Object.assign(new Error("agy timed out"), {
+          code: "ETIMEDOUT",
+        }),
       }),
     );
 
@@ -847,6 +1099,7 @@ describe("Antigravity provider", () => {
       id: "gemini_5h",
       percentRemaining: 88,
     });
+    expect(readCachedProvider("agy")).toBeDefined();
   });
 
   it("does not treat a missing agy CLI as remaining quota", async () => {
@@ -915,7 +1168,12 @@ function runtimeWith(options: {
   cliQuota?: string | Error;
   requestJson?: AgyProbeRuntime["requestJson"];
   responses?: Record<string, unknown>;
-  onExec?: (command: string, args: string[], timeoutMs: number) => void;
+  onExec?: (
+    command: string,
+    args: string[],
+    timeoutMs: number,
+    options?: ExecFileTextOptions,
+  ) => void;
   onRequest?: (endpoint: AgyConnectionEndpoint, path: string) => void;
 }): AgyProbeRuntime {
   return {
@@ -925,8 +1183,8 @@ function runtimeWith(options: {
         options.agyPath ?? (options.cliQuota !== undefined ? "agy" : undefined)
       );
     },
-    async execFileText(command, args, timeoutMs) {
-      options.onExec?.(command, args, timeoutMs);
+    async execFileText(command, args, timeoutMs, execOptions) {
+      options.onExec?.(command, args, timeoutMs, execOptions);
       if (command === "ps") {
         if (options.psError) throw options.psError;
         return options.ps ?? "";
@@ -1016,6 +1274,8 @@ function cachedAgyQuota(): ProviderQuota {
         kind: "session",
         percentUsed: 12,
         percentRemaining: 88,
+        // Still ahead, so a stale fallback may serve it.
+        resetsAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
       },
     ],
     state: {

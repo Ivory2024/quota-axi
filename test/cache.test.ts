@@ -13,11 +13,18 @@ import {
   deleteCachedProvider,
   readCachedClaudeProvider,
   readCachedCommandCodeProvider,
+  readCachedCodexProvider,
   readCachedKimiProvider,
+  readCachedDevinProvider,
   readCachedMiniMaxProvider,
   readCachedProvider,
+  readReusableProviders,
+  retireCodexAccount,
+  stampReadingInputs,
   writeCachedProviders,
+  stampCodexStoredAccountId,
 } from "../src/cache.js";
+import { inputsDigest } from "../src/lib/input-trace.js";
 import { annotateQuotaAdvice } from "../src/advice.js";
 import { cacheFilePath, claudeCredentialContextId } from "../src/lib/fs.js";
 import {
@@ -28,6 +35,12 @@ import {
 import { staleFromCache } from "../src/providers/common.js";
 import { withQuotaSemantics } from "../src/interpretation.js";
 import { createKimiCodeCliCredentialSource } from "../src/providers/kimi-code-cli-credential.js";
+import { createKimiAdapter } from "../src/providers/kimi.js";
+import {
+  clearDevinReadingContextId,
+  devinCacheContextId,
+  publishDevinReadingContextId,
+} from "../src/providers/devin-cache-context.js";
 import { publishMiniMaxReadingContextId } from "../src/providers/minimax-cache-context.js";
 import type { ProviderId, ProviderQuota } from "../src/types.js";
 
@@ -47,9 +60,74 @@ afterEach(() => {
   if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   tempDir = undefined;
   clearCommandCodeReadingContextId();
+  clearDevinReadingContextId();
 });
 
 describe("quota cache", () => {
+  it("serves Codex stale quota only for a matching stored account", () => {
+    useTempCache();
+    const snapshot = quota("codex", 42);
+    stampCodexStoredAccountId(snapshot, "acct-signed-in");
+    writeCachedProviders([snapshot]);
+
+    expect(readCachedCodexProvider(undefined, [])).toBeUndefined();
+    expect(readCachedCodexProvider(undefined, ["acct-other"])).toBeUndefined();
+    expect(
+      readCachedCodexProvider(undefined, ["acct-signed-in"]),
+    ).toMatchObject({
+      windows: [{ percentUsed: 42 }],
+    });
+  });
+
+  it("continues from a mismatched Codex home snapshot to a matching keyless snapshot", () => {
+    useTempCache();
+    const foreignHome = quota("codex", 10);
+    foreignHome.accountKey = "codex-home";
+    stampCodexStoredAccountId(foreignHome, "acct-foreign");
+    const signedIn = quota("codex", 80);
+    stampCodexStoredAccountId(signedIn, "acct-signed-in");
+    writeCachedProviders([foreignHome, signedIn]);
+
+    expect(
+      readCachedCodexProvider("codex-home", ["acct-signed-in"]),
+    ).toMatchObject({ windows: [{ percentUsed: 80 }] });
+  });
+
+  it("retires only Codex snapshots stamped for rejected accounts", () => {
+    useTempCache();
+    const defaultA = quota("codex", 10);
+    const keyedA = quota("codex", 20);
+    keyedA.accountKey = "openai-codex";
+    const keyedB = quota("codex", 30);
+    keyedB.accountKey = "openai-codex-work";
+    const unstamped = quota("codex", 40);
+    unstamped.accountKey = "openai-codex-unstamped";
+    stampCodexStoredAccountId(defaultA, "acct-a");
+    stampCodexStoredAccountId(keyedA, "acct-a");
+    stampCodexStoredAccountId(keyedB, "acct-b");
+    writeCachedProviders([defaultA, keyedA, keyedB, unstamped]);
+
+    retireCodexAccount(["acct-a"]);
+
+    expect(readCachedProvider("codex")).toBeUndefined();
+    expect(readCachedProvider("codex", "openai-codex")).toBeUndefined();
+    expect(readCachedProvider("codex", "openai-codex-work")).toMatchObject({
+      windows: [{ percentUsed: 30 }],
+    });
+    expect(readCachedProvider("codex", "openai-codex-unstamped")).toMatchObject(
+      { windows: [{ percentUsed: 40 }] },
+    );
+  });
+
+  it("withholds legacy Codex snapshots without account context", () => {
+    useTempCache();
+    writeCachedProviders([quota("codex", 42)]);
+
+    expect(
+      readCachedCodexProvider(undefined, ["acct-signed-in"]),
+    ).toBeUndefined();
+  });
+
   it.each([true, false])(
     "leaves persistent snapshots untouched by native Claude reads with windows %s",
     (hasWindows) => {
@@ -191,7 +269,15 @@ describe("quota cache", () => {
 
     const later = annotateQuotaAdvice({
       generatedAt: "2026-07-06T19:10:00Z",
-      providers: [staleFromCache(cached!, "fetch failed", ["api"], [])],
+      providers: [
+        staleFromCache(
+          cached!,
+          "fetch failed",
+          ["api"],
+          [],
+          Date.parse("2026-07-06T19:10:00Z"),
+        )!,
+      ],
     });
     expect(later.schemaVersion).toBe(5);
     expect(later.providers[0]?.accountKey).toBeUndefined();
@@ -201,6 +287,14 @@ describe("quota cache", () => {
     useTempCache();
     const codex = quota("codex", 20);
     codex.windows = [
+      {
+        id: "spend_control",
+        label: "workspace credit cap",
+        kind: "credits",
+        percentUsed: 0.15191666666666667,
+        percentRemaining: 99.84808333333334,
+        resetsAt: "2026-11-01T00:00:00.000Z",
+      },
       {
         id: "five_hour",
         label: "session",
@@ -229,6 +323,7 @@ describe("quota cache", () => {
     writeCachedProviders([codex]);
 
     expect(readCachedProvider("codex")?.windows.map(({ id }) => id)).toEqual([
+      "spend_control",
       "five_hour",
       "weekly",
       "weekly_2",
@@ -272,6 +367,145 @@ describe("quota cache", () => {
     expect(readCachedProvider("alibaba")).toMatchObject({
       provider: "alibaba",
       source: "cli",
+      windows: [{ percentUsed: 18 }],
+    });
+  });
+
+  it("does not serve Higgsfield through --max-age, including after a login switch", () => {
+    useTempCache();
+    const jobs = { sampled: 4, completed: 2, failed: 1, other: 1 };
+    const snapshot = higgsfieldQuota(jobs);
+    stampReadingInputs(snapshot, tracedInputs());
+    writeCachedProviders([snapshot], snapshot.state.refreshedAt);
+
+    expect(
+      readReusableProviders(
+        "higgsfield",
+        90,
+        Date.parse("2026-07-06T18:10:30Z"),
+      ),
+    ).toBeUndefined();
+    expect(readCachedProvider("higgsfield")?.jobs).toEqual(jobs);
+    expect(readCachedProvider("higgsfield")?.credits).toEqual({
+      remaining: 5999.8,
+      unit: "credits",
+    });
+  });
+
+  it("still reuses a non-Higgsfield CLI snapshot through --max-age", () => {
+    useTempCache();
+    const alibaba = {
+      ...quota("alibaba", 18),
+      source: "cli" as const,
+    };
+    stampReadingInputs(alibaba, tracedInputs());
+    writeCachedProviders([alibaba], alibaba.state.refreshedAt);
+
+    const reused = readReusableProviders(
+      "alibaba",
+      90,
+      Date.parse("2026-07-06T18:10:30Z"),
+    );
+    expect(reused).toHaveLength(1);
+    expect(reused?.[0]).toMatchObject({
+      provider: "alibaba",
+      source: "cli",
+      windows: [{ percentUsed: 18 }],
+      state: { reused: true },
+    });
+  });
+
+  it("keeps Higgsfield jobs absent on a stale cache read when the snapshot carried none", () => {
+    useTempCache();
+    writeCachedProviders([higgsfieldQuota()]);
+
+    expect(readCachedProvider("higgsfield")?.jobs).toBeUndefined();
+    expect(readCachedProvider("higgsfield")?.credits).toEqual({
+      remaining: 5999.8,
+      unit: "credits",
+    });
+  });
+
+  it("rejects a Higgsfield record whose cached jobs rollup is malformed", () => {
+    useTempCache();
+    writeCachedProviders([
+      {
+        ...higgsfieldQuota(),
+        jobs: { sampled: 4 } as ProviderQuota["jobs"],
+      },
+    ]);
+
+    expect(readCachedProvider("higgsfield")).toBeUndefined();
+
+    writeCachedProviders([higgsfieldQuota()]);
+    const file = cacheFilePath();
+    const cached = JSON.parse(readFileSync(file, "utf8")) as {
+      providers: Array<{ provider: string; jobs?: unknown }>;
+    };
+    cached.providers.find((entry) => entry.provider === "higgsfield")!.jobs = {
+      sampled: 4,
+      completed: 9,
+      failed: 0,
+      other: 0,
+    };
+    writeFileSync(file, JSON.stringify(cached));
+
+    expect(readCachedProvider("higgsfield")).toBeUndefined();
+  });
+
+  it("rejects a Higgsfield record whose cached jobs counts are fractional", () => {
+    useTempCache();
+    writeCachedProviders([
+      {
+        ...higgsfieldQuota(),
+        jobs: { sampled: 1.5, completed: 0.75, failed: 0.5, other: 0.25 },
+      },
+    ]);
+
+    expect(readCachedProvider("higgsfield")).toBeUndefined();
+  });
+
+  it("strips Higgsfield job identity fields before they reach the cache file", () => {
+    useTempCache();
+    writeCachedProviders([
+      {
+        ...higgsfieldQuota({
+          sampled: 4,
+          completed: 2,
+          failed: 1,
+          other: 1,
+        }),
+        jobs: {
+          sampled: 4,
+          completed: 2,
+          failed: 1,
+          other: 1,
+          prompt: "secret prompt",
+          id: "job-1",
+        } as ProviderQuota["jobs"],
+      },
+    ]);
+
+    const cached = readCachedProvider("higgsfield");
+    expect(cached?.jobs).toEqual({
+      sampled: 4,
+      completed: 2,
+      failed: 1,
+      other: 1,
+    });
+    const raw = readFileSync(cacheFilePath(), "utf8");
+    expect(raw).not.toContain("secret prompt");
+    expect(raw).not.toContain("job-1");
+  });
+
+  it("never writes a Copilot native snapshot over a servable legacy one", () => {
+    useTempCache();
+    writeCachedProviders([quota("copilot", 18)]);
+
+    writeCachedProviders([{ ...quota("copilot", 55), source: "cli" as const }]);
+
+    expect(readCachedProvider("copilot")).toMatchObject({
+      source: "oauth",
       windows: [{ percentUsed: 18 }],
     });
   });
@@ -394,6 +628,91 @@ oauth_host = "https://auth.kimi.ai"
     expect(
       readCachedKimiProvider(await selectKimiEnvironment()),
     ).toBeUndefined();
+  });
+
+  /**
+   * An authenticated `/usages` body with no quota field (a Free-tier account)
+   * is a fresh reading with no windows, per README Cache "fresh with no
+   * windows clears this context's slot" - not a stale-eligible failure that
+   * would preserve a pre-existing snapshot.
+   */
+  it("clears an existing Kimi snapshot on a fresh no-quota reading, and a later transient failure does not resurrect it", async () => {
+    useTempCache();
+    const codeHome = join(tempDir!, "no-quota-kimi-code-home");
+    mkdirSync(codeHome, { recursive: true });
+    process.env.KIMI_CODE_HOME = codeHome;
+
+    const piBroker = {
+      resolve: async () =>
+        ({
+          status: "available",
+          kind: "api_key",
+          credential: "synthetic-pi-key",
+        }) as const,
+      inspect: async () => "available" as const,
+    };
+    const cliSource = createKimiCodeCliCredentialSource();
+    const readKimi = (respond: () => Response, at: string) =>
+      createKimiAdapter({
+        broker: piBroker,
+        cliCredentialSource: cliSource,
+        fetch: (async () => respond()) as unknown as typeof fetch,
+        readCachedProvider: readCachedKimiProvider,
+        deleteCachedProvider,
+        now: () => Date.parse(at),
+      }).fetchQuota({ allowKeychainPrompt: false, refreshCredentials: false });
+
+    /**
+     * The snapshot the no-quota reading has to clear belongs to the identity
+     * that reading publishes, so it comes from a real successful read rather
+     * than from a context another test happened to leave behind.
+     */
+    const withWindows = await readKimi(
+      () =>
+        new Response(
+          JSON.stringify({
+            usages: {
+              limit_5h: {
+                used_ratio: 0.42,
+                reset_time: "2026-09-22T04:00:00Z",
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      "2026-09-21T23:55:00Z",
+    );
+    expect(withWindows.state.status).toBe("fresh");
+    expect(withWindows.windows.length).toBeGreaterThan(0);
+    writeCachedProviders([withWindows]);
+    expect(readCachedProvider("kimi")).toBeDefined();
+
+    const noQuotaReport = await readKimi(
+      () =>
+        new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      "2026-09-22T00:00:00Z",
+    );
+
+    expect(noQuotaReport.state).toMatchObject({
+      status: "fresh",
+      stale: false,
+      authStatus: "usable",
+    });
+    expect(noQuotaReport.windows).toEqual([]);
+
+    writeCachedProviders([noQuotaReport]);
+    expect(readCachedProvider("kimi")).toBeUndefined();
+
+    const failed = await readKimi(() => {
+      throw new Error("network down");
+    }, "2026-09-22T00:05:00Z");
+
+    expect(failed.state.stale).toBe(false);
+    expect(failed.windows).toEqual([]);
+    expect(readCachedProvider("kimi")).toBeUndefined();
   });
 
   it("scopes MiniMax cache reuse to the reading's source and deployment", () => {
@@ -554,7 +873,8 @@ oauth_host = "https://auth.kimi.ai"
       "fetch failed: synthetic outage",
       ["kimi-code"],
       [],
-    );
+      Date.parse("2026-07-06T18:20:00Z"),
+    )!;
     const monthCode = stale.windows.find(
       (window) => window.id === "month_code",
     );
@@ -672,6 +992,44 @@ oauth_host = "https://auth.kimi.ai"
     expect(readCachedCommandCodeProvider(contextId)).toBeUndefined();
     expect(readCachedProvider("commandcode")).toBeUndefined();
   });
+
+  it("reuses a Devin snapshot only for the source, host, and key that wrote it", () => {
+    useTempCache();
+    const contextId = devinCacheContextId(
+      "env:WINDSURF_API_KEY",
+      "https://server.codeium.com",
+      "synthetic-devin-cache-key",
+    );
+    const otherId = devinCacheContextId(
+      "file:credentials.toml",
+      "https://server.codeium.com",
+      "synthetic-devin-cache-key",
+    );
+    publishDevinReadingContextId(contextId);
+    writeCachedProviders([quota("devin", 40)]);
+
+    clearDevinReadingContextId();
+    writeCachedProviders([quota("devin", 5)]);
+
+    expect(readCachedDevinProvider(contextId)?.windows[0].percentUsed).toBe(40);
+    expect(readCachedDevinProvider(otherId)).toBeUndefined();
+    expect(readCachedProvider("devin")?.windows[0].percentUsed).toBe(40);
+  });
+
+  it("clears a Devin snapshot after an identified no-window report", () => {
+    useTempCache();
+    const contextId = devinCacheContextId(
+      "env:WINDSURF_API_KEY",
+      "https://server.codeium.com",
+      "synthetic-devin-cache-key",
+    );
+    publishDevinReadingContextId(contextId);
+    writeCachedProviders([quota("devin", 40)]);
+    writeCachedProviders([quotaWithoutWindows("devin")]);
+
+    expect(readCachedDevinProvider(contextId)).toBeUndefined();
+    expect(readCachedProvider("devin")).toBeUndefined();
+  });
 });
 
 function useTempCache(): void {
@@ -719,6 +1077,42 @@ function quotaWithoutWindows(provider: ProviderId): ProviderQuota {
   };
 }
 
+function higgsfieldQuota(jobs?: ProviderQuota["jobs"]): ProviderQuota {
+  return {
+    provider: "higgsfield",
+    label: "Higgsfield",
+    source: "cli",
+    plan: "ultra",
+    windows: [
+      {
+        id: "credits",
+        label: "credits",
+        kind: "credits",
+        percentUsed: 0.2,
+        percentRemaining: 99.8,
+      },
+    ],
+    credits: { remaining: 5999.8, unit: "credits" },
+    ...(jobs ? { jobs } : {}),
+    state: {
+      status: "fresh",
+      stale: false,
+      refreshedAt: "2026-07-06T18:10:00Z",
+      sourcesTried: [
+        "higgsfield-cli",
+        "higgsfield-transactions",
+        "higgsfield-jobs",
+      ],
+    },
+  };
+}
+
+function tracedInputs() {
+  const path = join(tempDir as string, "traced-input");
+  writeFileSync(path, "");
+  return { paths: [path], digest: inputsDigest([path]) };
+}
+
 function providerLabel(provider: ProviderId): string {
   if (provider === "claude") return "Claude";
   if (provider === "codex") return "Codex";
@@ -730,5 +1124,6 @@ function providerLabel(provider: ProviderId): string {
   if (provider === "commandcode") return "Command Code";
   if (provider === "opencode-go") return "OpenCode Go";
   if (provider === "minimax") return "MiniMax";
+  if (provider === "devin") return "Devin";
   return "Kimi";
 }

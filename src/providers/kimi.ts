@@ -13,7 +13,9 @@ import type {
   QuotaWindow,
   SourceAttempt,
 } from "../types.js";
+import { calendarMonthsBefore } from "../lib/time.js";
 import { VERSION } from "../version.js";
+import { servableStaleWindows, servableUntrustedWindowIds } from "./common.js";
 import { publishKimiReadingContextId } from "./kimi-cache-context.js";
 import {
   selectCredential,
@@ -77,13 +79,21 @@ const DURATION_MULTIPLIERS: Record<string, number> = {
 export type KimiDiagnostic =
   | { code: "limits_missing" }
   | { code: "limits_invalid" }
+  | { code: "usage_invalid" }
   | { code: "detail_invalid"; index: number }
   | { code: "usage_detail_invalid"; key: string };
 
-export type NormalizedKimiPayload = {
-  windows: QuotaWindow[];
-  diagnostics: KimiDiagnostic[];
-};
+export type NormalizedKimiPayload =
+  | { kind: "windows"; windows: QuotaWindow[]; diagnostics: KimiDiagnostic[] }
+  /**
+   * The vendor answered `/usages` with an authenticated body that declares no
+   * quota-bearing field at all (a Free-tier account gets `{}`), distinct from
+   * a body that declares a quota field this reader cannot parse.
+   */
+  | { kind: "no_quota" };
+
+/** Keys `/usages` documents alongside the quota map that carry no quota data. */
+const KIMI_NON_QUOTA_KEYS = new Set(["goods_version", "boosterWallet"]);
 
 type KimiDependencies = {
   broker: KimiCredentialBroker;
@@ -114,6 +124,14 @@ type ResponseBodyLifetime = {
   cancel(action?: () => Promise<unknown> | undefined): Promise<void>;
 };
 
+/**
+ * The Kimi Code skip that establishes nothing about the account either way: a
+ * configuration quota-axi could not walk to its OAuth reference may name any
+ * slot, so its absence is never shown.
+ */
+export const KIMI_CODE_ENVIRONMENT_UNCONFIRMED =
+  "kimi_code_cli_credential_unconfirmed";
+
 export function createKimiAdapter(
   overrides: Partial<KimiDependencies> = {},
 ): ProviderAdapter {
@@ -132,6 +150,8 @@ export function createKimiAdapter(
   return {
     id: "kimi",
     label: "Kimi",
+    isUncertainSkip: (attempt) =>
+      attempt.error === KIMI_CODE_ENVIRONMENT_UNCONFIRMED,
     fetchQuota(_options: ProviderOptions): Promise<ProviderQuota> {
       if (inFlight) return inFlight;
       const acquisition = acquireKimiQuota(dependencies).finally(() => {
@@ -178,7 +198,7 @@ export function createKimiAdapter(
                   : cliInspection === "invalid_config"
                     ? "kimi_code_cli_config_invalid"
                     : cliInspection === "environment_unconfirmed"
-                      ? "kimi_code_cli_credential_unconfirmed"
+                      ? KIMI_CODE_ENVIRONMENT_UNCONFIRMED
                       : undefined;
 
       return {
@@ -294,6 +314,12 @@ async function acquireKimiQuota(
   const failures: KimiFailureRecord[] = [];
   /** The cache identity of the source being consulted, for the failure paths. */
   let cacheContextId: string | undefined;
+  /**
+   * Whether any source proved live but declared no quota-bearing field, so
+   * the outer loop still consults the sibling source (mirroring Grok's
+   * `live_no_quota` floor) instead of stopping on the first empty answer.
+   */
+  let sawLiveNoQuota = false;
 
   try {
     /**
@@ -355,7 +381,7 @@ async function acquireKimiQuota(
         async (selected) => {
           attempts.push({ source, status: "failed" });
           try {
-            report = await readKimiQuota(
+            const outcome = await readKimiQuota(
               selected.credential,
               candidate.quotaUrl,
               source,
@@ -369,7 +395,11 @@ async function acquireKimiQuota(
              * environment, which a Pi reading never contacted.
              */
             if (cacheContextId) publishKimiReadingContextId(cacheContextId);
-            return { kind: "quota", result: report };
+            if (outcome.kind === "no_quota") {
+              return { kind: "live_no_quota" };
+            }
+            report = outcome.result;
+            return { kind: "quota", result: outcome.result };
           } catch (error) {
             const failure = asKimiFailure(error);
             /**
@@ -402,6 +432,11 @@ async function acquireKimiQuota(
         },
       );
       if (credentialSelection.outcome === "quota" && report) return report;
+      if (credentialSelection.outcome === "live_no_quota") {
+        sawLiveNoQuota = true;
+        if (controller.signal.aborted) break;
+        continue;
+      }
       // Handover on credential problems only: a transport, decoding, or
       // server failure is about the request, so it is reported as-is.
       if (
@@ -410,6 +445,10 @@ async function acquireKimiQuota(
       ) {
         break;
       }
+    }
+
+    if (sawLiveNoQuota) {
+      return noQuotaReport(attempts, dependencies);
     }
 
     const defining = definingFailure(failures);
@@ -560,10 +599,17 @@ function untrustedWindowId(diagnostic: KimiDiagnostic): string {
       return `limit:${diagnostic.index}`;
     case "usage_detail_invalid":
       return `usages:${diagnostic.key}`;
+    case "usage_invalid":
+      return "usage";
     default:
       return "limits";
   }
 }
+
+type KimiReadOutcome =
+  | { kind: "quota"; result: ProviderQuota }
+  /** The source answered live but declared no quota-bearing field. */
+  | { kind: "no_quota" };
 
 async function readKimiQuota(
   credential: string,
@@ -572,7 +618,7 @@ async function readKimiQuota(
   attempts: SourceAttempt[],
   signal: AbortSignal,
   dependencies: KimiDependencies,
-): Promise<ProviderQuota> {
+): Promise<KimiReadOutcome> {
   const payload = await requestKimiQuota(
     credential,
     quotaUrl,
@@ -581,22 +627,28 @@ async function readKimiQuota(
     dependencies.now,
   );
   const normalized = normalizeKimiPayload(payload);
+  attempts[attempts.length - 1] = { source, status: "success" };
+  if (normalized.kind === "no_quota") {
+    return { kind: "no_quota" };
+  }
   const untrustedWindowIds = normalized.diagnostics.map(untrustedWindowId);
   const refreshedAt = new Date(dependencies.now()).toISOString();
-  attempts[attempts.length - 1] = { source, status: "success" };
   return {
-    provider: "kimi",
-    label: "Kimi",
-    source: "api",
-    windows: normalized.windows,
-    state: {
-      status: "fresh",
-      stale: false,
-      refreshedAt,
-      ...(untrustedWindowIds.length > 0 ? { untrustedWindowIds } : {}),
-      sourcesTried: attempts.map(({ source: name }) => name),
+    kind: "quota",
+    result: {
+      provider: "kimi",
+      label: "Kimi",
+      source: "api",
+      windows: normalized.windows,
+      state: {
+        status: "fresh",
+        stale: false,
+        refreshedAt,
+        ...(untrustedWindowIds.length > 0 ? { untrustedWindowIds } : {}),
+        sourcesTried: attempts.map(({ source: name }) => name),
+      },
+      attempts,
     },
-    attempts,
   };
 }
 
@@ -773,7 +825,7 @@ function cliCredentialFailureFor(
    * would retire cached numbers that are still the best it can say.
    */
   if (resolution.status === "environment_unconfirmed") {
-    return new KimiFailure("kimi_code_cli_credential_unconfirmed", {
+    return new KimiFailure(KIMI_CODE_ENVIRONMENT_UNCONFIRMED, {
       staleEligible: true,
     });
   }
@@ -781,6 +833,34 @@ function cliCredentialFailureFor(
     status: "auth_required",
     definitiveAuth: true,
   });
+}
+
+/**
+ * No source yielded quota windows, but at least one proved live with an
+ * authenticated, established-empty `/usages` body (a Free-tier account).
+ * That is a usable credential with nothing to report, not an error: report
+ * fresh with no windows, mirroring the Copilot entitlement-only precedent.
+ * Per README Cache, a fresh reading with no windows clears this context's
+ * cache slot rather than serving a stale one.
+ */
+function noQuotaReport(
+  attempts: SourceAttempt[],
+  dependencies: KimiDependencies,
+): ProviderQuota {
+  return {
+    provider: "kimi",
+    label: "Kimi",
+    source: "api",
+    windows: [],
+    state: {
+      status: "fresh",
+      stale: false,
+      refreshedAt: new Date(dependencies.now()).toISOString(),
+      authStatus: "usable",
+      sourcesTried: attempts.map(({ source }) => source),
+    },
+    attempts,
+  };
 }
 
 function failureReport(
@@ -851,17 +931,17 @@ function staleKimiReport(
   }
   const refreshedAt = Date.parse(cached.state.refreshedAt);
   if (!Number.isFinite(refreshedAt)) return undefined;
-  const ageMilliseconds = Math.max(0, now - refreshedAt);
-  const windows = cached.windows.filter((window) => {
-    if (window.resetsAt) {
-      const resetsAt = Date.parse(window.resetsAt);
-      if (Number.isFinite(resetsAt)) return resetsAt > now;
+  const ageMilliseconds = now - refreshedAt;
+  const windows = servableStaleWindows(cached, now).filter((window) => {
+    if (window.resetsAt && Number.isFinite(Date.parse(window.resetsAt))) {
+      return true;
     }
     const maxAgeSeconds =
       window.kind === "weekly" ? WEEK_SECONDS : FIVE_HOURS_SECONDS;
     return ageMilliseconds < maxAgeSeconds * 1_000;
   });
   if (windows.length === 0) return undefined;
+  const untrustedWindowIds = servableUntrustedWindowIds(cached, windows);
 
   return {
     provider: "kimi",
@@ -875,9 +955,7 @@ function staleKimiReport(
       error,
       ...(retryAfter ? { retryAfter } : {}),
       ...(authStatus ? { authStatus } : {}),
-      ...(cached.state.untrustedWindowIds
-        ? { untrustedWindowIds: cached.state.untrustedWindowIds }
-        : {}),
+      ...(untrustedWindowIds ? { untrustedWindowIds } : {}),
       sourcesTried: [...attempts.map(({ source }) => source), "cache"],
     },
     attempts,
@@ -1082,12 +1160,25 @@ function createResponseBodyLifetime(response: Response): ResponseBodyLifetime {
   };
 }
 
+/**
+ * `cycleMonths` marks a window whose cycle is the member's monthly
+ * subscription cycle, so its start is the reported reset stepped back that
+ * many calendar months. The evidence is Kimi's own documentation: the Help
+ * Center's "Membership Credit Updates and Usage Rules"
+ * (https://www.kimi.com/en/help/membership/membership-update-rules) says
+ * membership credits refresh monthly on the subscription date, "not by
+ * calendar month", for monthly and annual memberships alike, and Kimi Code's
+ * "Membership Benefits" (https://www.kimi.com/code/docs/en/kimi-code/membership.html)
+ * says Kimi Code shares that "Kimi membership monthly total quota" until "the
+ * monthly quota resets".
+ */
 const KIMI_USAGES_WINDOWS: ReadonlyArray<{
   key: string;
   id: string;
   label: string;
   kind: QuotaWindow["kind"];
   windowSeconds?: number;
+  cycleMonths?: number;
   shareOf?: string;
 }> = [
   {
@@ -1109,6 +1200,7 @@ const KIMI_USAGES_WINDOWS: ReadonlyArray<{
     id: "month_total",
     label: "month",
     kind: "monthly",
+    cycleMonths: 1,
   },
   {
     key: "limit_month_code",
@@ -1126,13 +1218,84 @@ export function normalizeKimiPayload(payload: unknown): NormalizedKimiPayload {
   }
 
   const fromUsages = normalizeUsagesMap(root.usages);
-  if (fromUsages && fromUsages.windows.length > 0) return fromUsages;
-
+  const usagesWindows = fromUsages?.windows ?? [];
+  const usagesDiagnostics = fromUsages?.diagnostics ?? [];
   const principal = normalizeDetail(root.usage);
+
   if (!principal) {
-    throw new KimiFailure("schema_invalid", { staleEligible: true });
+    if (usagesWindows.length === 0) {
+      if (isEstablishedEmptyKimiPayload(root)) return { kind: "no_quota" };
+      throw new KimiFailure("schema_invalid", { staleEligible: true });
+    }
+    // A declared principal this reader cannot parse may be the binding week,
+    // so the map's windows are reported as partial rather than as the whole.
+    const diagnostics: KimiDiagnostic[] =
+      root.usage === undefined || root.usage === null
+        ? usagesDiagnostics
+        : [...usagesDiagnostics, { code: "usage_invalid" }];
+    return { kind: "windows", windows: usagesWindows, diagnostics };
   }
 
+  // The map carries its own five-hour window, so an absent `limits` array is
+  // only a gap when the principal is the sole shape.
+  const legacy = normalizeLegacyShape(
+    principal,
+    root.limits,
+    usagesWindows.length === 0,
+  );
+  const diagnostics = [...usagesDiagnostics, ...legacy.diagnostics];
+  if (usagesWindows.length === 0) {
+    return { kind: "windows", windows: legacy.windows, diagnostics };
+  }
+  return {
+    kind: "windows",
+    windows: mergeKimiShapes(usagesWindows, legacy.windows),
+    diagnostics,
+  };
+}
+
+/**
+ * Kimi Code answers `/usages` with both shapes at once: the principal `usage`
+ * object plus `limits[]`, and the `usages` map. Each reports the same weekly
+ * and five-hour windows (the resets agree), but the figures can disagree: a
+ * captured Vivace response carried `usage` at 92 of 100 used while
+ * `usages.limit_7d` read a `used_ratio` of 0, and Kimi's own account page
+ * showed the 7-day Code usage at 92%. Which counter Kimi enforces is not
+ * documented, so a window both shapes report takes the more-used figure. That
+ * never overstates headroom, and it keeps the principal figure whenever it is
+ * the one that binds. The map's window wins a tie, and windows only one shape
+ * reports are kept in map order, then wire order. Both shapes describe the
+ * same window, so when the more-used side carries no parseable reset the
+ * other side's reset is kept: without one, a stale reading of that window
+ * would outlive the deadline the vendor did report.
+ */
+function mergeKimiShapes(
+  usagesWindows: QuotaWindow[],
+  legacyWindows: QuotaWindow[],
+): QuotaWindow[] {
+  const legacyById = new Map(
+    legacyWindows.map((window) => [window.id, window]),
+  );
+  const merged = usagesWindows.map((window) => {
+    const legacy = legacyById.get(window.id);
+    if (!legacy) return window;
+    legacyById.delete(window.id);
+    const [bound, other] =
+      (legacy.percentUsed ?? 0) > (window.percentUsed ?? 0)
+        ? [legacy, window]
+        : [window, legacy];
+    return bound.resetsAt || !other.resetsAt
+      ? bound
+      : { ...bound, resetsAt: other.resetsAt };
+  });
+  return [...merged, ...legacyById.values()];
+}
+
+function normalizeLegacyShape(
+  principal: NormalizedDetail,
+  limitsValue: unknown,
+  limitsRequired: boolean,
+): { windows: QuotaWindow[]; diagnostics: KimiDiagnostic[] } {
   const windows: QuotaWindow[] = [
     {
       id: "weekly",
@@ -1144,10 +1307,9 @@ export function normalizeKimiPayload(payload: unknown): NormalizedKimiPayload {
       ...(principal.resetsAt ? { resetsAt: principal.resetsAt } : {}),
     },
   ];
-  const diagnostics: KimiDiagnostic[] = [...(fromUsages?.diagnostics ?? [])];
-  const limitsValue = root.limits;
+  const diagnostics: KimiDiagnostic[] = [];
   if (limitsValue === undefined || limitsValue === null) {
-    diagnostics.push({ code: "limits_missing" });
+    if (limitsRequired) diagnostics.push({ code: "limits_missing" });
     return { windows, diagnostics };
   }
   if (!Array.isArray(limitsValue)) {
@@ -1156,10 +1318,7 @@ export function normalizeKimiPayload(payload: unknown): NormalizedKimiPayload {
   }
 
   let fiveHourSeen = false;
-  for (const [offset, rawEntry] of (Array.isArray(limitsValue)
-    ? limitsValue
-    : []
-  ).entries()) {
+  for (const [offset, rawEntry] of limitsValue.entries()) {
     const index = offset + 1;
     const entry = objectValue(rawEntry);
     const detail = normalizeDetail(entry?.detail);
@@ -1184,7 +1343,42 @@ export function normalizeKimiPayload(payload: unknown): NormalizedKimiPayload {
   return { windows, diagnostics };
 }
 
-function normalizeUsagesMap(value: unknown): NormalizedKimiPayload | undefined {
+/**
+ * A body establishes no quota windows when it is a JSON object that declares
+ * none of the fields the vendor's own parser reads as quota - `usages`
+ * absent, `null`, or `{}`; `usage` absent or `null`; `limits` absent, `null`,
+ * or `[]` - and carries no other key besides the vendor's own documented
+ * non-quota companions. Any other key, or any of those fields carrying
+ * content, means the body declares quota this reader could not parse, which
+ * stays `schema_invalid` instead.
+ */
+function isEstablishedEmptyKimiPayload(root: Record<string, unknown>): boolean {
+  if (!isAbsentOrEmptyObject(root.usages)) return false;
+  if (root.usage !== undefined && root.usage !== null) return false;
+  if (!isAbsentOrEmptyArray(root.limits)) return false;
+  const knownKeys = new Set([
+    "usages",
+    "usage",
+    "limits",
+    ...KIMI_NON_QUOTA_KEYS,
+  ]);
+  return Object.keys(root).every((key) => knownKeys.has(key));
+}
+
+function isAbsentOrEmptyObject(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  const obj = objectValue(value);
+  return obj !== undefined && Object.keys(obj).length === 0;
+}
+
+function isAbsentOrEmptyArray(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  return Array.isArray(value) && value.length === 0;
+}
+
+function normalizeUsagesMap(
+  value: unknown,
+): { windows: QuotaWindow[]; diagnostics: KimiDiagnostic[] } | undefined {
   const usages = objectValue(value);
   if (!usages) return undefined;
 
@@ -1197,6 +1391,12 @@ function normalizeUsagesMap(value: unknown): NormalizedKimiPayload | undefined {
       diagnostics.push({ code: "usage_detail_invalid", key: spec.key });
       continue;
     }
+    // A monthly cycle's start exists only relative to a reported reset; with
+    // no reset the window keeps no cycle rather than an invented one.
+    const startsAt =
+      spec.cycleMonths !== undefined && detail.resetsAt
+        ? calendarMonthsBefore(detail.resetsAt, spec.cycleMonths)
+        : undefined;
     windows.push({
       id: spec.id,
       label: spec.label,
@@ -1208,6 +1408,7 @@ function normalizeUsagesMap(value: unknown): NormalizedKimiPayload | undefined {
       ...(typeof spec.windowSeconds === "number"
         ? { windowSeconds: spec.windowSeconds }
         : {}),
+      ...(startsAt ? { startsAt } : {}),
       ...(detail.resetsAt ? { resetsAt: detail.resetsAt } : {}),
     });
   }

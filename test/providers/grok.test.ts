@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { writeCachedProviders } from "../../src/cache.js";
+import { readCachedProvider, writeCachedProviders } from "../../src/cache.js";
 import { main } from "../../src/cli.js";
 import { withQuotaSemantics } from "../../src/interpretation.js";
 import { statusFromError } from "../../src/providers/common.js";
@@ -262,6 +262,8 @@ function cachedGrok(source: "api" | "web"): ProviderQuota {
         kind: "credits",
         percentUsed: 20,
         percentRemaining: 80,
+        // Still ahead, so a stale fallback may serve it.
+        resetsAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
       },
     ],
     state: {
@@ -295,8 +297,8 @@ describe("Grok consumer quota parsing", () => {
     expect(result.windows).toEqual([
       {
         id: "credits",
-        label: "credits",
-        kind: "credits",
+        label: "week",
+        kind: "weekly",
         percentUsed: 18.25,
         percentRemaining: 81.75,
         startsAt: "2026-07-20T20:00:00.000Z",
@@ -305,7 +307,7 @@ describe("Grok consumer quota parsing", () => {
       {
         id: "product:grok_build",
         label: "Grok Build",
-        kind: "credits",
+        kind: "weekly",
         percentUsed: 33.25,
         percentRemaining: 66.75,
         startsAt: "2026-07-20T20:00:00.000Z",
@@ -314,7 +316,7 @@ describe("Grok consumer quota parsing", () => {
       {
         id: "product:chat",
         label: "Chat",
-        kind: "credits",
+        kind: "weekly",
         percentUsed: 100,
         percentRemaining: 0,
         startsAt: "2026-07-20T20:00:00.000Z",
@@ -364,6 +366,50 @@ describe("Grok consumer quota parsing", () => {
     expect(result.credits).toEqual({ remaining: 0, unit: "credits" });
   });
 
+  it("pins pre-existing behaviour: prepaid zero never bounds a live weekly window, whose kind and label come from the period", () => {
+    const result = normalizeGrokConsumerPayload(
+      consumerPayload({
+        percentUsed: 64,
+        products: [{ product: 2, usagePercent: 64 }],
+        prepaid: 0,
+      }),
+    );
+    const report = withQuotaSemantics(
+      {
+        provider: "grok",
+        label: "Grok",
+        source: "web",
+        ...result,
+        state: {
+          status: "fresh",
+          stale: false,
+          refreshedAt: result.refreshedAt,
+          sourcesTried: ["web"],
+        },
+      },
+      "2026-07-23T07:05:00.000Z",
+    );
+
+    expect(result.windows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "credits",
+          label: "week",
+          kind: "weekly",
+        }),
+        expect.objectContaining({ id: "product:grok_build", kind: "weekly" }),
+      ]),
+    );
+    expect(result.credits).toEqual({ remaining: 0, unit: "credits" });
+    expect(report.quotaSemantics?.effectiveAvailability).toContainEqual(
+      expect.objectContaining({
+        scope: "all_products",
+        status: "known",
+        effectivePercentRemaining: 36,
+      }),
+    );
+  });
+
   it("supports monthly periods and unknown product enum values", () => {
     const result = normalizeGrokConsumerPayload(
       consumerPayload({
@@ -375,6 +421,7 @@ describe("Grok consumer quota parsing", () => {
     expect(result.windows[1]).toMatchObject({
       id: "product:unknown_99",
       label: "Product 99",
+      kind: "monthly",
       percentUsed: 12.5,
     });
   });
@@ -1404,6 +1451,57 @@ describe("Grok expired access-token classification", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("retires a cached snapshot on definitive sign-out and matches the no-cache reading", async () => {
+    writeCachedProviders([cachedGrok("web")]);
+
+    const result = await fetchQuota({
+      allowKeychainPrompt: false,
+      refreshCredentials: false,
+    });
+
+    expect(result).toMatchObject({
+      source: "unavailable",
+      windows: [],
+      state: {
+        status: "auth_required",
+        stale: false,
+        error: "Grok sign-in required",
+        authStatus: "unusable",
+      },
+    });
+    expect(readCachedProvider("grok")).toBeUndefined();
+
+    const json = JSON.parse(
+      await captureCli(["--provider", "grok", "--json"]),
+    ) as QuotaAxiResponse;
+    expect(json.providers[0]?.state).toMatchObject({
+      status: "auth_required",
+      authStatus: "unusable",
+      error: "Grok sign-in required",
+    });
+    expect(process.exitCode).toBe(1);
+
+    const tui = await captureCli(["--provider", "grok", "--tui", "--once"]);
+    expect(tui).toContain("signed out");
+    expect(tui).not.toContain("cache · stale");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("keeps the cached snapshot when the present Grok auth store cannot be parsed", async () => {
+    writeCachedProviders([cachedGrok("web")]);
+    mkdirSync(dirname(process.env.GROK_AUTH_JSON!), { recursive: true });
+    writeFileSync(process.env.GROK_AUTH_JSON!, "{malformed");
+
+    const result = await fetchQuota({
+      allowKeychainPrompt: false,
+      refreshCredentials: false,
+    });
+
+    expect(result.state.status).toBe("stale");
+    expect(result.windows.length).toBeGreaterThan(0);
+    expect(readCachedProvider("grok")).toBeDefined();
+  });
+
   it("retains expired-token classification on stale web cache fallback after probe rejection", async () => {
     writeAuth({
       "https://auth.x.ai::fixture-client": {
@@ -1448,6 +1546,7 @@ describe("Grok expired access-token classification", () => {
       ],
     });
     expect(result.state.error).not.toMatch(/sign-in/i);
+    expect(readCachedProvider("grok")).toBeDefined();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -2872,6 +2971,8 @@ describe("Grok CLI rendering regression", () => {
       windows: [
         {
           id: "credits",
+          label: "week",
+          kind: "weekly",
           percentUsed: 0,
           percentRemaining: 100,
         },
@@ -2879,8 +2980,8 @@ describe("Grok CLI rendering regression", () => {
     });
 
     const toon = await captureCli(["--provider", "grok", "--full"]);
-    expect(toon).toContain("grok,credits,credits,100");
-    expect(toon).not.toContain("grok,credits,credits,unknown");
+    expect(toon).toContain("grok,credits,week,100");
+    expect(toon).not.toContain("grok,credits,week,unknown");
     expect(await captureCli(["--provider", "grok"])).toContain(
       "grok,all_products,100",
     );
