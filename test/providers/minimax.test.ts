@@ -300,6 +300,8 @@ describe("MiniMax provider", () => {
           label: "MiniMax-M3 5h",
           kind: "model",
           percentRemaining: 40,
+          // Still ahead, so a stale fallback may serve it.
+          resetsAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
         },
       ],
       state: {
@@ -616,6 +618,7 @@ describe("MiniMax provider", () => {
         source: "minimax:config.json",
         status: "invalid",
         error: "credential_missing",
+        credentialPresent: true,
       }),
     ]);
     expect(fetch).not.toHaveBeenCalled();
@@ -849,6 +852,8 @@ describe("MiniMax provider", () => {
             label: "MiniMax-M3 5h",
             kind: "model" as const,
             percentRemaining: 40,
+            // Still ahead, so a stale fallback may serve it.
+            resetsAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
           },
         ],
         state: {
@@ -1019,6 +1024,7 @@ describe("MiniMax provider", () => {
             source: "pi:minimax",
             status: "failed",
             error: "credential_resolution_failed",
+            credentialPresent: true,
           },
           {
             source: "minimax:config.json",
@@ -1038,6 +1044,7 @@ describe("MiniMax provider", () => {
           source: "pi:minimax",
           status: "error",
           error: "file_too_large",
+          credentialPresent: true,
         }),
         expect.objectContaining({
           source: "minimax:config.json",

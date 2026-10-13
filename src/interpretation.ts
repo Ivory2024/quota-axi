@@ -182,7 +182,73 @@ function semanticsFor(
       );
     case "elevenlabs":
       return elevenLabsSemantics(provider.windows, generatedAt);
+    case "devin":
+      return devinSemantics(
+        provider.windows,
+        provider.state.untrustedWindowIds ?? [],
+        generatedAt,
+      );
+    case "muse":
+      return museSemantics(
+        provider.windows,
+        provider.state.untrustedWindowIds ?? [],
+        generatedAt,
+      );
+    case "higgsfield":
+      return higgsfieldSemantics(provider.windows, generatedAt);
   }
+}
+
+/**
+ * Muse's key endpoint reports the subscription's rolling five-hour `window`
+ * and its `weekly` usage, and both gate the same subscription usage, so they
+ * jointly bound every model at `all_models` - Kimi's session-plus-week shape.
+ * A window of any other length, an entry that carried no usable percentage, or
+ * one of those two windows missing while the other remains, is not folded in:
+ * it stays unresolved and leaves the bound non-definitive.
+ */
+const MUSE_ACCOUNT_WINDOW_IDS = new Set(["five_hour", "weekly"]);
+
+function museSemantics(
+  windows: QuotaWindow[],
+  untrustedWindowIds: string[],
+  generatedAt: string,
+): QuotaSemantics {
+  const bounds = windows.filter(({ id }) => MUSE_ACCOUNT_WINDOW_IDS.has(id));
+  // The two windows jointly bound every model. A live weekly (or five-hour)
+  // figure alone is not a complete bound: the missing partner may still gate
+  // usage, so it stays unresolved rather than publishing a definitive remaining.
+  const missing =
+    bounds.length > 0
+      ? [...MUSE_ACCOUNT_WINDOW_IDS].filter(
+          (id) => !bounds.some((window) => window.id === id),
+        )
+      : [];
+  const unresolvedWindowIds = [
+    ...new Set([
+      ...windows
+        .filter(({ id }) => !MUSE_ACCOUNT_WINDOW_IDS.has(id))
+        .map(({ id }) => id),
+      ...untrustedWindowIds,
+      ...missing,
+    ]),
+  ];
+  if (unresolvedWindowIds.length > 0) {
+    return {
+      status: "partial",
+      description:
+        "Muse's five-hour and weekly subscription windows jointly bound every model, but a missing, unrecognized, or unparsed window leaves a bound unknown, so effective remaining is unknown.",
+      effectiveAvailability:
+        bounds.length > 0
+          ? [unresolvedAvailability("all_models", bounds, unresolvedWindowIds)]
+          : [],
+      unresolvedWindowIds,
+    };
+  }
+  return knownSemantics(
+    bounds.length > 0 ? [availability("all_models", bounds, generatedAt)] : [],
+    "Muse's five-hour and weekly subscription windows jointly bound every model, so effective remaining is the minimum across them.",
+  );
 }
 
 /**
@@ -194,6 +260,58 @@ function semanticsFor(
  * spent, not that requests stop. It is a speech allowance rather than a
  * coding-agent lane, so it never binds a model scope either.
  */
+/**
+ * Devin's daily and weekly windows meter included plan quota. Paid extra usage
+ * continues past a zeroed window, and free models do not draw on these windows,
+ * so they bound `included_quota` rather than `all_models`. Max omits the daily
+ * window only when `hideDailyQuota` is explicitly true, and weekly alone is
+ * then the bound. Otherwise incomplete caps remain unresolved rather than
+ * publishing a known effective remaining percentage.
+ */
+function devinSemantics(
+  windows: QuotaWindow[],
+  untrustedWindowIds: string[],
+  generatedAt: string,
+): QuotaSemantics {
+  const daily = windows.filter(({ id }) => id === "daily");
+  const weekly = windows.filter(({ id }) => id === "weekly");
+  const expected = [...weekly, ...daily];
+  const recognized = new Set(expected);
+  const unresolved = windows.filter((window) => !recognized.has(window));
+  const unresolvedWindowIds = [
+    ...new Set([...unresolved.map(({ id }) => id), ...untrustedWindowIds]),
+  ];
+  const description =
+    "Devin's daily and weekly windows bound included quota. Free models do not draw on them, and paid extra usage continues past a zeroed window, so they are not an all-model bound. Organization and administrator limits are not reported in these fields.";
+  if (unresolvedWindowIds.length > 0) {
+    return {
+      status: "partial",
+      description,
+      effectiveAvailability:
+        weekly.length > 0
+          ? [
+              unresolvedAvailability(
+                "included_quota",
+                expected,
+                unresolvedWindowIds,
+              ),
+            ]
+          : [],
+      unresolvedWindowIds,
+    };
+  }
+  if (weekly.length === 0) {
+    return knownSemantics(
+      [],
+      "Devin reported no weekly included-quota window, so no effective remaining percentage can be computed.",
+    );
+  }
+  return knownSemantics(
+    [availability("included_quota", expected, generatedAt)],
+    description,
+  );
+}
+
 function elevenLabsSemantics(
   windows: QuotaWindow[],
   generatedAt: string,
@@ -204,6 +322,30 @@ function elevenLabsSemantics(
   return knownSemantics(
     characters.length > 0
       ? [availability("included_characters", characters, generatedAt)]
+      : [],
+    description,
+  );
+}
+
+/**
+ * Higgsfield meters plan generation credits, not a coding-agent model lane.
+ * The credits window is only published when the first transactions page's sole
+ * subscription-credit grant reconciles with the reported balance (that grant
+ * plus the on-page entries newer than it), so it bounds `included_credits`
+ * rather than `all_models`. With no vendor reset, pace stays unknown; runway
+ * reads `exhausted_now` at zero balance and `unknown` otherwise, naming
+ * `credits` in `unmeasurableWindowIds`.
+ */
+function higgsfieldSemantics(
+  windows: QuotaWindow[],
+  generatedAt: string,
+): QuotaSemantics {
+  const credits = windows.filter(({ id }) => id === "credits");
+  const description =
+    "Higgsfield's credits window is the subscription plan's included generation-credit allowance, bounding the included_credits scope only and never a model lane, and it publishes only when the first transactions page's sole positive-credit Subscription Credits grant reconciles with the reported balance (that grant plus the on-page entries newer than it), so a zeroed published window means zero balance; with no vendor reset, pace stays unknown, and runway reads exhausted_now at zero balance and unknown otherwise, naming credits in unmeasurableWindowIds.";
+  return knownSemantics(
+    credits.length > 0
+      ? [availability("included_credits", credits, generatedAt)]
       : [],
     description,
   );
@@ -221,6 +363,13 @@ function opencodeGoSemantics(
   windows: QuotaWindow[],
   generatedAt: string,
 ): QuotaSemantics {
+  // No windows at all means the provider was never set up (or is signed
+  // out), not that a subset of the plan's stacked caps is missing - that
+  // distinction is handled below. Fall through to the standard no-window
+  // reading instead of naming all three caps as unresolved.
+  if (windows.length === 0) {
+    return unknownSemantics(windows, "OpenCode Go reported no quota windows.");
+  }
   const plan = windows.filter(({ id }) =>
     ["rolling", "five_hour", "weekly", "monthly"].includes(id),
   );
@@ -434,7 +583,14 @@ function codexSemantics(
   windows: QuotaWindow[],
   generatedAt: string,
 ): QuotaSemantics {
-  const account = windows.filter(isCodexAccountWindow);
+  const spendControl = windows.filter(({ id }) => id === "spend_control");
+  // Included allowance and credit-funded usage are separate vendor budgets.
+  // The cap is an account bound only for a reading with no other quota evidence;
+  // its relationship to rate-limit windows is not a simultaneous minimum.
+  const account =
+    spendControl.length === windows.length
+      ? spendControl
+      : windows.filter(isCodexAccountWindow);
   const codeReview = windows.filter(
     ({ id }) =>
       id.startsWith("code_review_five_hour") ||
@@ -449,7 +605,12 @@ function codexSemantics(
     scoped.push(window);
     models.set(scope, scoped);
   }
-  const recognized = new Set([...account, ...codeReview, ...modelWindows]);
+  const recognized = new Set([
+    ...account,
+    ...spendControl,
+    ...codeReview,
+    ...modelWindows,
+  ]);
   const unresolved = windows.filter((window) => !recognized.has(window));
   if (unresolved.length > 0) {
     return partialSemantics(
@@ -481,7 +642,7 @@ function codexSemantics(
   }
   return knownSemantics(
     effectiveAvailability,
-    "Codex base account windows are applied as a bound to every model scope, including scopes that have named model windows of their own, so that model's effective remaining percentage is the minimum across the named windows. A named model window is an additional, separately metered budget the vendor reports alongside the base limit, so a base window at zero while that model's own windows all still report allowance is a contradiction between the two readings and is published as a bound conflict rather than as the model's exhaustion. Code-review windows describe a separate workload and are not included in model availability.",
+    "Codex base account windows are applied as a bound to every model scope, including scopes that have named model windows of their own, so that model's effective remaining percentage is the minimum across the named windows. A named model window is an additional, separately metered budget the vendor reports alongside the base limit, so a base window at zero while that model's own windows all still report allowance is a contradiction between the two readings and is published as a bound conflict rather than as the model's exhaustion. Code-review windows describe a separate workload and are not included in model availability. A workspace credit cap bounds all_models only when it is the sole quota evidence. Alongside rate-limit windows it stays published separately and does not enter effective availability; no combined allowance is inferred.",
   );
 }
 
